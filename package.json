@@ -1,0 +1,72 @@
+{
+  "name": "opencode-kimi-subscription",
+  "version": "0.1.0",
+  "description": "Use your Kimi Code (Moonshot) subscription in OpenCode via OAuth — sign in with the device flow, no API tokens.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "kimi",
+    "kimi-code",
+    "moonshot",
+    "auth",
+    "oauth",
+    "device-flow",
+    "subscription",
+    "plugin"
+  ],
+  "license": "MIT",
+  "author": "Max Harley <max@harley.gg>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/t94j0/opencode-kimi-subscription.git"
+  },
+  "homepage": "https://github.com/t94j0/opencode-kimi-subscription#readme",
+  "bugs": {
+    "url": "https://github.com/t94j0/opencode-kimi-subscription/issues"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.3",
+    "@types/node": "^22",
+    "oxlint": "^1.0.0",
+    "prettier": "^3.3.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "pretest": "npm run build",
+    "test": "node --test test/unit.test.mjs test/smoke.test.mjs",
+    "test:integration": "node test/integration.mjs",
+    "ci": "npm run lint && npm run format:check && npm run typecheck && npm test",
+    "prepublishOnly": "npm run build"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules
+*.log
+.DS_Store
+.env
+dist
+bun.lock
+package-lock.json
+pnpm-lock.yaml
+*.swp
+.*.swp
+*.swo

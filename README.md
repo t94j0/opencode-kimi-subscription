@@ -4,16 +4,12 @@ Use your Kimi Code (Moonshot) subscription in [OpenCode](https://opencode.ai):
 sign in with Kimi's OAuth device flow and spend your subscription instead of
 pay-as-you-go API tokens.
 
-OpenCode's built-in "Kimi For Coding" provider covers pay-as-you-go API keys.
-This plugin covers the other path — a Kimi Code subscription — which OpenCode
-doesn't support out of the box. It adds a "Sign in with Kimi (subscription)"
-method to `opencode auth login`, refreshes the short-lived access token
-transparently, and self-registers the `kimi-code` provider. Models are
-discovered from the live `/models` endpoint and cached, so new Kimi models
-appear automatically, with a static baseline (K3, Kimi K2.7 Coding, Kimi K2.7
-Coding Highspeed) as the fallback. The plugin obtains its own device token and
-never touches `~/.kimi-code`, so the official `kimi` CLI keeps working
-alongside it.
+OpenCode's built-in "Kimi For Coding" provider only covers pay-as-you-go API
+keys; this plugin adds the subscription path. It puts a "Sign in with Kimi
+(subscription)" method in `opencode auth login`, registers the `kimi-code`
+provider and its models automatically, and keeps the access token fresh. It
+obtains its own device token and never touches `~/.kimi-code`, so the official
+`kimi` CLI keeps working alongside it.
 
 ## Install
 
@@ -35,17 +31,6 @@ opencode                 # /models → Kimi Code (subscription) → K3
 ```
 
 That's the only manual step; you don't need to add a `provider` block.
-
-To run from source instead:
-
-```
-git clone https://github.com/t94j0/opencode-kimi-subscription
-cd opencode-kimi-subscription && npm install && npm run build
-```
-
-```json
-{ "plugin": ["/absolute/path/to/opencode-kimi-subscription/dist/index.js"] }
-```
 
 ## How it works
 
@@ -99,20 +84,3 @@ Common issues:
   remove it and let the plugin manage the request.
 - Inspect the stored token with `opencode auth list`; remove it with
   `opencode auth logout kimi-code`.
-
-## Development
-
-TypeScript (strict), built to plain ESM in `dist/`; no runtime dependencies.
-
-```
-npm run build            # tsc -> dist/ (+ .d.ts)
-npm run typecheck        # tsc --noEmit
-npm run lint             # oxlint
-npm run format           # prettier --write   (format:check verifies)
-npm test                 # builds, then unit + smoke tests (no network)
-npm run ci               # lint + format:check + typecheck + test
-
-KIMI_INTEGRATION=1 npm run build && npm run test:integration   # live API test (needs login)
-```
-
-CI runs `npm run ci` on every push and PR (`.github/workflows/ci.yml`).

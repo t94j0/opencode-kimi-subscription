@@ -21,6 +21,9 @@ export type UpstreamModel = {
 // /models fetch filter).
 export type DiscoveredModel = UpstreamModel & { id: string };
 
+// OpenCode's model-config modality literals.
+export type Modality = "text" | "audio" | "image" | "video" | "pdf";
+
 export type OAuthRecord = { type: "oauth"; access: string; refresh: string; expires: number };
 
 export type ModelCache = { ts: number; models: DiscoveredModel[] };
@@ -59,12 +62,21 @@ export function toAuth(data: Record<string, any>, now = Date.now()): OAuthRecord
 
 // Map an upstream model to OpenCode's provider-config model shape.
 export function toConfigModel(m: DiscoveredModel) {
+  const input: Modality[] = ["text"];
+  if (m.supports_image_in) input.push("image");
+  if (m.supports_video_in) input.push("video");
+
   return {
     name: m.display_name || m.id,
     limit: { context: Number(m.context_length) || 262_144, output: DEFAULT_OUTPUT_LIMIT },
     reasoning: !!m.supports_reasoning || m.supports_thinking_type === "only" || m.supports_thinking_type === "both",
     tool_call: m.supports_tool_use !== false,
     attachment: !!(m.supports_image_in || m.supports_video_in),
+    // `attachment` alone is not enough: OpenCode gates what it will actually
+    // send on `modalities.input`, which defaults to text-only. Without this an
+    // image-capable model still has its attachments dropped before the request
+    // is built, and it replies that it cannot read images.
+    modalities: { input, output: ["text"] as Modality[] },
     // kimi coding models only accept temperature === 1; hide the knob.
     temperature: false,
   };

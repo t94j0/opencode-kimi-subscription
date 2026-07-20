@@ -69,14 +69,26 @@ const MODEL_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 // Static baseline (context windows from the CLI). Seeds the provider on first
 // run / when logged out; live discovery replaces it once a request has run.
+// Keep the capability flags in sync with what /models reports — a baseline that
+// understates them registers the model as text-only until the cache warms.
 const STATIC_MODELS: DiscoveredModel[] = [
-  { id: "k3", display_name: "Kimi K3", context_length: 1_048_576, supports_reasoning: true, supports_tool_use: true },
+  {
+    id: "k3",
+    display_name: "Kimi K3",
+    context_length: 1_048_576,
+    supports_reasoning: true,
+    supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
+  },
   {
     id: "kimi-for-coding",
     display_name: "Kimi K2.7 Coding",
     context_length: 262_144,
     supports_reasoning: true,
     supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
   },
   {
     id: "kimi-for-coding-highspeed",
@@ -84,6 +96,8 @@ const STATIC_MODELS: DiscoveredModel[] = [
     context_length: 262_144,
     supports_reasoning: true,
     supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
   },
 ];
 

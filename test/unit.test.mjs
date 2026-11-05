@@ -77,6 +77,21 @@ describe("toConfigModel", () => {
     assert.equal(toConfigModel({ id: "m", supports_video_in: true }).attachment, true);
     assert.equal(toConfigModel({ id: "m" }).attachment, false);
   });
+  it("mirrors input support into modalities so OpenCode actually sends them", () => {
+    assert.deepEqual(toConfigModel({ id: "m", supports_image_in: true }).modalities.input, ["text", "image"]);
+    assert.deepEqual(toConfigModel({ id: "m", supports_video_in: true }).modalities.input, ["text", "video"]);
+    assert.deepEqual(toConfigModel({ id: "m", supports_image_in: true, supports_video_in: true }).modalities.input, [
+      "text",
+      "image",
+      "video",
+    ]);
+  });
+  it("keeps modalities text-only when the model has no image/video input", () => {
+    assert.deepEqual(toConfigModel({ id: "m" }).modalities.input, ["text"]);
+  });
+  it("always reports text output", () => {
+    assert.deepEqual(toConfigModel({ id: "m", supports_image_in: true }).modalities.output, ["text"]);
+  });
   it("always hides the temperature knob", () => {
     assert.equal(toConfigModel({ id: "m" }).temperature, false);
   });

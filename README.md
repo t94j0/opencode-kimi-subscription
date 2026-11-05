@@ -50,9 +50,14 @@ Derived from the official `kimi` CLI (v0.26.0):
    store, and returns a `fetch` that injects `Authorization: Bearer …`, refreshes
    the token when < 7.5 min remain or on a 401/403, and pins `temperature: 1`
    (these models reject any other value).
-3. **Model discovery** — each request refreshes an on-disk cache
-   (`~/.cache/opencode-kimi-subscription/models.json`, 6 h TTL) from the live
-   `/models` list; the `config` hook reads that cache at startup.
+3. **Model discovery** — at startup, the `config` hook fetches `/models` using
+   the OAuth credential in OpenCode's auth store (`$XDG_DATA_HOME/opencode/auth.json`,
+   default `~/.local/share/opencode/auth.json`), refreshing the token if needed.
+   Models are available immediately, before the first completion. The on-disk
+   cache (`~/.cache/opencode-kimi-subscription/models.json`, 6 h TTL) avoids repeated
+   requests. If discovery fails, the last cached list or static baseline is used.
+   Completion requests also refresh expired caches for the next startup.
+   After signing in for the first time, restart OpenCode to discover models.
 
 ## Configuration
 

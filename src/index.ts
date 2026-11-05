@@ -11,12 +11,9 @@
 // It obtains its own device token and never touches ~/.kimi-code, so the
 // official `kimi` CLI keeps working alongside it.
 //
-// Dynamic model discovery: OpenCode resolves a provider's models from config at
-// startup and (as of 1.18.x) does not invoke the plugin `provider` hook for
-// config-registered providers. So instead we discover models at request time —
-// when the access token is available — and cache them to disk; the config hook
-// reads that cache on the next startup. New Kimi models therefore appear
-// automatically without hardcoding, with a static baseline as the fallback.
+// Discover models during config loading using OpenCode's stored OAuth token.
+// Cache the list for 6h and fall back to cached/static models when offline.
+// Request-time discovery keeps the cache fresh for the next startup.
 //
 // The endpoints/client_id/params below were derived from the kimi CLI (v0.26.0).
 //
@@ -38,7 +35,7 @@ import {
   type DeviceAuthorization,
   type DiscoveredModel,
   type ModelCache,
-  type UpstreamModel,
+  type OAuthRecord,
 } from "./internal.js";
 
 type GetAuth = Parameters<NonNullable<AuthHook["loader"]>>[0];
@@ -65,18 +62,39 @@ const FETCH_TIMEOUT_MS = 30_000;
 const CACHE_FILE =
   process.env.KIMI_SUBSCRIPTION_CACHE ||
   join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode-kimi-subscription", "models.json");
+// OpenCode exposes auth.set but no auth.get to plugins before the loader runs.
+const AUTH_FILE = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "auth.json");
+
+async function readStoredAuth(): Promise<OAuthRecord> {
+  const auth = JSON.parse(readFileSync(AUTH_FILE, "utf8"))[PROVIDER];
+  if (auth?.type !== "oauth" || typeof auth.access !== "string" || typeof auth.refresh !== "string") {
+    throw new Error("no stored Kimi OAuth credential");
+  }
+  return auth;
+}
+
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 // Static baseline (context windows from the CLI). Seeds the provider on first
-// run / when logged out; live discovery replaces it once a request has run.
+// run / when logged out; successful discovery replaces it at startup.
 const STATIC_MODELS: DiscoveredModel[] = [
-  { id: "k3", display_name: "Kimi K3", context_length: 1_048_576, supports_reasoning: true, supports_tool_use: true },
+  {
+    id: "k3",
+    display_name: "Kimi K3",
+    context_length: 1_048_576,
+    supports_reasoning: true,
+    supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
+  },
   {
     id: "kimi-for-coding",
     display_name: "Kimi K2.7 Coding",
     context_length: 262_144,
     supports_reasoning: true,
     supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
   },
   {
     id: "kimi-for-coding-highspeed",
@@ -84,6 +102,8 @@ const STATIC_MODELS: DiscoveredModel[] = [
     context_length: 262_144,
     supports_reasoning: true,
     supports_tool_use: true,
+    supports_image_in: true,
+    supports_video_in: true,
   },
 ];
 
@@ -134,8 +154,10 @@ async function fetchModels(token: string): Promise<DiscoveredModel[]> {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`/models returned HTTP ${res.status}`);
-  const json = (await res.json()) as { data?: UpstreamModel[] };
-  return Array.isArray(json?.data) ? json.data.filter((m): m is DiscoveredModel => !!m && !!m.id) : [];
+  const json = (await res.json()) as { data?: unknown } | null;
+  const cache = { models: json?.data };
+  if (!isValidModelCache(cache)) throw new Error("/models returned an invalid model list");
+  return cache.models;
 }
 
 function readModelCache(): ModelCache | null {
@@ -179,15 +201,16 @@ const KimiCodePlugin: Plugin = async ({ client }) => {
   let syncingModels = false;
   async function maybeSyncModels(token: string) {
     const cached = readModelCache();
-    if (cached && Date.now() - cached.ts < MODEL_TTL_MS) return;
+    if (cached && Date.now() - cached.ts < MODEL_TTL_MS) return cached.models;
     if (syncingModels) return;
     syncingModels = true;
     try {
       const models = await fetchModels(token);
       if (models.length) {
         writeModelCache(models);
-        log("debug", "refreshed model cache from /models", { models: models.map((m) => m.id) });
+        log("debug", "discovered models from /models", { models: models.map((m) => m.id) });
       }
+      return models;
     } catch (err) {
       log("debug", "model cache refresh failed; keeping current list", { error: errorMessage(err) });
     } finally {
@@ -216,7 +239,7 @@ const KimiCodePlugin: Plugin = async ({ client }) => {
         }
         try {
           const next = toAuth(await refreshToken(auth.refresh));
-          await client.auth.set({ path: { id: PROVIDER }, body: next });
+          await client.auth.set({ path: { id: PROVIDER }, body: next, throwOnError: true });
           log("debug", "access token refreshed", { validForMs: next.expires - Date.now() });
           return next.access;
         } catch (err) {
@@ -232,13 +255,21 @@ const KimiCodePlugin: Plugin = async ({ client }) => {
   }
 
   return {
-    // Register the provider + models. Uses the discovered-model cache when
-    // present (see maybeSyncModels), else the static baseline. Respects an
-    // existing user-defined provider.
+    // Discover before OpenCode resolves the model picker; preserve user config.
     config: async (config: Config) => {
       config.provider ??= {};
       if (!config.provider[PROVIDER]) {
-        const { models, source } = resolveModels();
+        const cached = readModelCache();
+        let discovered: DiscoveredModel[] | undefined;
+        if (!cached || !(Date.now() - cached.ts < MODEL_TTL_MS)) {
+          try {
+            await readStoredAuth();
+            discovered = await maybeSyncModels(await ensureFresh(readStoredAuth, false));
+          } catch (err) {
+            log("debug", "startup discovery unavailable; using cached/static models", { error: errorMessage(err) });
+          }
+        }
+        const { models, source } = discovered ? { models: discovered, source: "discovery" } : resolveModels();
         config.provider[PROVIDER] = {
           npm: PROVIDER_NPM,
           name: "Kimi Code (subscription)",

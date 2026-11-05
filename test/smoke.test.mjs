@@ -5,14 +5,20 @@
 // refresh-and-retry-once behavior on an upstream 401.
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createOpencodeClient } from "@opencode-ai/sdk";
 
 // Point the model cache at a throwaway file BEFORE importing the plugin (the
 // cache path is resolved at module load).
 const CACHE = join(tmpdir(), `kimi-smoke-${process.pid}.json`);
 process.env.KIMI_SUBSCRIPTION_CACHE = CACHE;
+const DATA = join(tmpdir(), `kimi-smoke-data-${process.pid}`);
+process.env.XDG_DATA_HOME = DATA;
+const AUTH_FILE = join(DATA, "opencode", "auth.json");
+mkdirSync(join(DATA, "opencode"), { recursive: true });
+after(() => rmSync(DATA, { recursive: true, force: true }));
 const mod = await import("../dist/index.js");
 const { KimiCodePlugin } = mod;
 
@@ -58,6 +64,43 @@ const FRESH_AUTH = () => ({ type: "oauth", access: "AAA", refresh: "RRR", expire
 const STALE_AUTH = () => ({ type: "oauth", access: "OLD", refresh: "RRR", expires: Date.now() + 60_000 });
 const REFRESH_OK = { access_token: "NEW", refresh_token: "NEWR", expires_in: 900 };
 const API_URL = "https://api.kimi.com/coding/v1/chat/completions";
+
+test("failed credential persistence rejects the request without reporting refresh success", async (t) => {
+  seedFreshCache();
+  const { client, calls } = makeClient();
+  let saves = 0;
+  client.auth = createOpencodeClient({
+    baseUrl: "http://opencode.test",
+    fetch: async () => {
+      saves++;
+      return jsonResponse(500, { name: "UnknownError", data: { message: "credential write failed" } });
+    },
+  }).auth;
+  const requests = stubFetch(t, [["/api/oauth/token", () => jsonResponse(200, REFRESH_OK)]]);
+  const hooks = await KimiCodePlugin({ client });
+  const { fetch: pluginFetch } = await hooks.auth.loader(async () => STALE_AUTH());
+  await assert.rejects(pluginFetch(API_URL, { method: "POST" }), /credential write failed/);
+  assert.equal(saves, 1);
+  assert.equal(requests.length, 1, "only token refresh is sent; no completion with unsaved credentials");
+  await settle();
+  assert.ok(calls.logs.some((l) => l.message === "token refresh failed"));
+  assert.ok(calls.logs.every((l) => l.message !== "access token refreshed"));
+});
+
+test("startup uses discovered models even when the cache cannot be written", async (t) => {
+  rmSync(CACHE, { force: true });
+  mkdirSync(CACHE); // A directory at the cache file path makes writes fail on every platform.
+  t.after(() => rmSync(CACHE, { recursive: true, force: true }));
+  writeFileSync(AUTH_FILE, JSON.stringify({ "kimi-code": FRESH_AUTH() }));
+  t.after(() => rmSync(AUTH_FILE, { force: true }));
+  stubFetch(t, [["/models", () => jsonResponse(200, { data: [{ id: "live-model", context_length: 1048576 }] })]]);
+  const { client } = makeClient();
+  const hooks = await KimiCodePlugin({ client });
+  const cfg = {};
+  await hooks.config(cfg);
+  assert.deepEqual(Object.keys(cfg.provider["kimi-code"].models), ["live-model"]);
+  assert.equal(cfg.provider["kimi-code"].models["live-model"].limit.context, 1048576);
+});
 
 test("entry module exports exactly the plugin (OpenCode invokes every export as a plugin)", () => {
   assert.deepEqual(Object.keys(mod).sort(), ["KimiCodePlugin", "default"]);
@@ -221,3 +264,50 @@ test("a failed refresh propagates, never hits the API, and raises a toast", asyn
     "session-expired toast raised",
   );
 });
+
+for (const stale of [false, true]) {
+  test(`startup discovers models before any completion (stale auth: ${stale})`, async (t) => {
+    rmSync(CACHE, { force: true });
+    writeFileSync(AUTH_FILE, JSON.stringify({ "kimi-code": stale ? STALE_AUTH() : FRESH_AUTH() }));
+    t.after(() => rmSync(AUTH_FILE, { force: true }));
+    const { client, calls } = makeClient();
+    const requests = stubFetch(t, [
+      ["/api/oauth/token", () => jsonResponse(200, REFRESH_OK)],
+      [
+        "/models",
+        (init) => {
+          assert.equal(init.headers.Authorization, `Bearer ${stale ? "NEW" : "AAA"}`);
+          return jsonResponse(200, { data: [{ id: "new-model", display_name: "New", context_length: 1048576 }] });
+        },
+      ],
+    ]);
+    const hooks = await KimiCodePlugin({ client });
+    const cfg = {};
+    await hooks.config(cfg);
+    assert.deepEqual(Object.keys(cfg.provider["kimi-code"].models), ["new-model"]);
+    assert.equal(cfg.provider["kimi-code"].models["new-model"].limit.context, 1048576);
+    assert.equal(calls.authSet.length, stale ? 1 : 0);
+    assert.equal(JSON.parse(readFileSync(CACHE)).models[0].id, "new-model");
+    await hooks.config({});
+    assert.equal(requests.filter((r) => r.url.endsWith("/models")).length, 1, "fresh cache avoids repeat discovery");
+  });
+}
+
+for (const response of [
+  () => jsonResponse(503, {}),
+  () => jsonResponse(200, { data: [{ id: 123 }] }),
+  () => jsonResponse(200, { data: [] }),
+]) {
+  test("failed startup discovery preserves stale cache", async (t) => {
+    writeFileSync(CACHE, JSON.stringify({ ts: 1, models: [{ id: "cached-model" }] }));
+    writeFileSync(AUTH_FILE, JSON.stringify({ "kimi-code": FRESH_AUTH() }));
+    t.after(() => rmSync(AUTH_FILE, { force: true }));
+    stubFetch(t, [["/models", response]]);
+    const { client } = makeClient();
+    const hooks = await KimiCodePlugin({ client });
+    const cfg = {};
+    await hooks.config(cfg);
+    assert.deepEqual(Object.keys(cfg.provider["kimi-code"].models), ["cached-model"]);
+    assert.equal(JSON.parse(readFileSync(CACHE)).ts, 1);
+  });
+}

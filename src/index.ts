@@ -1,39 +1,40 @@
-// opencode-kimi-subscription — use your Kimi Code (Moonshot) subscription in OpenCode.
+// opencode-kimi-subscription (local fork, v0.2.0) — use your Kimi Code (Moonshot)
+// subscription in OpenCode 2.x.
 //
-// Adds a "Sign in with Kimi (subscription)" login to `opencode auth login` that
-// runs Kimi's OAuth 2.0 Device Authorization Grant, stores the token in
-// OpenCode's own auth store, refreshes the short-lived (15 min) access token
-// automatically, and self-registers the `kimi-code` provider + models — so the
-// only setup is one line in opencode.json:
+// Port of t94j0/opencode-kimi-subscription (MIT, v0.1.0) from the OpenCode V1
+// plugin API (default-exported async function) to the V2 `Plugin.define` API,
+// targeting OpenCode 2.2.x / @opencode/plugin 2.2.4.
 //
-//   { "plugin": ["opencode-kimi-subscription"] }
+// What it does:
+//  - self-registers the `kimi-code` provider (OpenAI-compatible,
+//    https://api.kimi.com/coding/v1) with the models discovered live from
+//    /models (6h TTL, on-disk cache, static baseline fallback); a user-defined
+//    `kimi-code` provider in config is respected as-is
+//  - adds a "Sign in with Kimi (subscription)" OAuth device-flow method to the
+//    `kimi-code` integration; the short-lived (15 min) access token is
+//    refreshed automatically via the registered `refresh` callback
+//  - pins temperature to 1 for every kimi-code request (kimi coding models
+//    only accept temperature === 1)
+//  - retries once on 401/403 (expired-token race)
 //
-// It obtains its own device token and never touches ~/.kimi-code, so the
-// official `kimi` CLI keeps working alongside it.
+// Load from opencode.json(c):
+//   { "plugin": ["d:/AI_PetProjects/opencode-kimi-subscription"] }
 //
-// Dynamic model discovery: OpenCode resolves a provider's models from config at
-// startup and (as of 1.18.x) does not invoke the plugin `provider` hook for
-// config-registered providers. So instead we discover models at request time —
-// when the access token is available — and cache them to disk; the config hook
-// reads that cache on the next startup. New Kimi models therefore appear
-// automatically without hardcoding, with a static baseline as the fallback.
+// Then sign in once (TUI: /connect -> kimi-code -> "Sign in with Kimi
+// (subscription)") and approve the device flow in your browser.
 //
-// The endpoints/client_id/params below were derived from the kimi CLI (v0.26.0).
-//
-// OpenCode invokes every function exported from this module as a plugin, so
-// only the plugin itself is exported; testable helpers live in internal.ts.
+// Endpoints / client_id / params are from the original plugin (derived from
+// the kimi CLI v0.26.0).
 
-import type { AuthHook, Config, Plugin } from "@opencode-ai/plugin";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { Credential, Integration, Model, Plugin, Provider } from "@opencode/plugin";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
+  DEFAULT_OUTPUT_LIMIT,
   classifyPollResponse,
   errorMessage,
   isValidModelCache,
-  pinTemperature,
-  toAuth,
-  toConfigModel,
   RefreshError,
   type DeviceAuthorization,
   type DiscoveredModel,
@@ -41,11 +42,12 @@ import {
   type UpstreamModel,
 } from "./internal.js";
 
-type GetAuth = Parameters<NonNullable<AuthHook["loader"]>>[0];
+const PROVIDER = "kimi-code" as Provider.ID;
+const INTEGRATION = "kimi-code" as Integration.ID;
+const METHOD = "device" as Integration.MethodID;
+const PROVIDER_PACKAGE = "@opencode/ai/providers/openai-compatible";
+const PROVIDER_NAME = "Kimi Code (subscription)";
 
-const SERVICE = "kimi-subscription";
-const PROVIDER = "kimi-code";
-const PROVIDER_NPM = "@ai-sdk/openai-compatible";
 const stripTrailingSlashes = (url: string) => url.replace(/\/+$/, "");
 const OAUTH_HOST = stripTrailingSlashes(
   process.env.KIMI_CODE_OAUTH_HOST || process.env.KIMI_OAUTH_HOST || "https://auth.kimi.com",
@@ -54,11 +56,9 @@ const API_BASE = stripTrailingSlashes(process.env.KIMI_CODE_BASE_URL || "https:/
 const CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
-// Refresh when < 450s remain, matching the CLI's max(300, expires_in*0.5).
-const REFRESH_SKEW_MS = 450_000;
 const LOGIN_TIMEOUT_MS = 900_000;
-// A hung fetch would otherwise wedge the refresh chain (and every request
-// behind it) forever, or latch the model-sync guard.
+// A hung fetch would otherwise wedge model sync forever or latch the
+// single-flight guard.
 const FETCH_TIMEOUT_MS = 30_000;
 
 // Where discovered models are cached, and how long before we refresh them.
@@ -68,7 +68,7 @@ const CACHE_FILE =
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 // Static baseline (context windows from the CLI). Seeds the provider on first
-// run / when logged out; live discovery replaces it once a request has run.
+// run / when logged out; live discovery replaces it once a sync has run.
 const STATIC_MODELS: DiscoveredModel[] = [
   { id: "k3", display_name: "Kimi K3", context_length: 1_048_576, supports_reasoning: true, supports_tool_use: true },
   {
@@ -153,164 +153,200 @@ function writeModelCache(models: DiscoveredModel[]) {
   } catch {}
 }
 
-// The model list to register now: freshest cache, else the static baseline.
-function resolveModels(): { models: DiscoveredModel[]; source: "cache" | "static" } {
-  const cached = readModelCache();
-  return cached ? { models: cached.models, source: "cache" } : { models: STATIC_MODELS, source: "static" };
+// Kimi token response -> V2 credential record (expires in ms).
+function toCredential(data: Record<string, any>, now = Date.now()): Credential.OAuth {
+  return {
+    type: "oauth",
+    methodID: METHOD,
+    access: data.access_token,
+    refresh: data.refresh_token,
+    expires: now + Number(data.expires_in || 900) * 1000,
+  };
 }
 
-const KimiCodePlugin: Plugin = async ({ client }) => {
-  // Structured logging into OpenCode's own log stream (see it with
-  // `opencode --print-logs` or in ~/.local/share/opencode/log/). Best-effort:
-  // logging/toasts must never throw into the request path.
-  const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
-    void Promise.resolve()
-      .then(() => client.app?.log({ body: { service: SERVICE, level, message, ...(extra ? { extra } : {}) } }))
-      .catch(() => {});
-  };
-  const toast = (variant: "info" | "success" | "warning" | "error", message: string, title?: string) => {
-    void Promise.resolve()
-      .then(() => client.tui?.showToast({ body: { variant, message, ...(title ? { title } : {}) } }))
-      .catch(() => {});
-  };
-
-  // Refresh the on-disk model cache (used by the next startup). Fire-and-forget
-  // from the request path, throttled by TTL and a single-flight guard.
-  let syncingModels = false;
-  async function maybeSyncModels(token: string) {
-    const cached = readModelCache();
-    if (cached && Date.now() - cached.ts < MODEL_TTL_MS) return;
-    if (syncingModels) return;
-    syncingModels = true;
-    try {
-      const models = await fetchModels(token);
-      if (models.length) {
-        writeModelCache(models);
-        log("debug", "refreshed model cache from /models", { models: models.map((m) => m.id) });
-      }
-    } catch (err) {
-      log("debug", "model cache refresh failed; keeping current list", { error: errorMessage(err) });
-    } finally {
-      syncingModels = false;
-    }
-  }
-
-  // Coalesce concurrent refreshes; each re-reads the latest stored auth so a
-  // rotated refresh_token is never reused.
-  let chain: Promise<string> = Promise.resolve("");
-  async function ensureFresh(getAuth: GetAuth, force: boolean): Promise<string> {
-    chain = chain
-      .catch(() => "")
-      .then(async () => {
-        const auth = await getAuth();
-        if (!auth || auth.type !== "oauth") {
-          log("error", "no stored credential; login required");
-          throw new Error(`${PROVIDER}: not logged in (run \`opencode auth login\`)`);
-        }
-        const stale = force || !auth.expires || auth.expires - Date.now() < REFRESH_SKEW_MS;
-        if (!stale) return auth.access;
-        if (!auth.refresh) {
-          log("error", "stored credential has no refresh token; login required");
-          toast("error", "Kimi sign-in is invalid — run: opencode auth login", "Kimi Code");
-          throw new Error(`${PROVIDER}: no refresh token; re-login`);
-        }
-        try {
-          const next = toAuth(await refreshToken(auth.refresh));
-          await client.auth.set({ path: { id: PROVIDER }, body: next });
-          log("debug", "access token refreshed", { validForMs: next.expires - Date.now() });
-          return next.access;
-        } catch (err) {
-          const status = err instanceof RefreshError ? err.status : undefined;
-          log("error", "token refresh failed", { status, error: errorMessage(err) });
-          if (status === 401 || status === 403) {
-            toast("error", "Kimi session expired — run: opencode auth login", "Kimi Code");
-          }
-          throw err;
-        }
-      });
-    return chain;
-  }
-
+// Upstream model -> V2 Model.Info (SDK defaults, per-model overrides).
+function toModelInfo(m: DiscoveredModel): Model.Info {
+  const base = Model.Info.default(PROVIDER, m.id as Model.ID);
   return {
-    // Register the provider + models. Uses the discovered-model cache when
-    // present (see maybeSyncModels), else the static baseline. Respects an
-    // existing user-defined provider.
-    config: async (config: Config) => {
-      config.provider ??= {};
-      if (!config.provider[PROVIDER]) {
-        const { models, source } = resolveModels();
-        config.provider[PROVIDER] = {
-          npm: PROVIDER_NPM,
-          name: "Kimi Code (subscription)",
-          options: { baseURL: API_BASE },
-          models: Object.fromEntries(models.map((m) => [m.id, toConfigModel(m)])),
-        };
-        log("debug", "registered kimi-code provider", { models: models.map((m) => m.id), source });
-      }
-    },
-
-    auth: {
-      provider: PROVIDER,
-      loader: async (getAuth) => ({
-        apiKey: "",
-        fetch: async (input: string | URL | Request, init?: RequestInit) => {
-          const attempt = async (token: string) => {
-            const headers = new Headers(init?.headers);
-            headers.set("authorization", `Bearer ${token}`);
-            headers.delete("x-api-key");
-            const body = pinTemperature(init?.body);
-            if (body !== init?.body) headers.delete("content-length");
-            return fetch(input, { ...init, headers, body });
-          };
-          const token = await ensureFresh(getAuth, false);
-          void maybeSyncModels(token); // fire-and-forget model-cache refresh
-          let res = await attempt(token);
-          if (res.status === 401 || res.status === 403) {
-            log("warn", `upstream ${res.status}; forcing refresh and retrying once`);
-            res = await attempt(await ensureFresh(getAuth, true));
-          }
-          return res;
-        },
-      }),
-      methods: [
-        {
-          type: "oauth",
-          label: "Sign in with Kimi (subscription)",
-          authorize: async () => {
-            const dev = await requestDeviceCode();
-            log("info", "device authorization started");
-            return {
-              url: dev.verification_uri_complete || dev.verification_uri || "",
-              instructions: `Approve the sign-in in your browser.${dev.user_code ? ` Code: ${dev.user_code}` : ""}`,
-              method: "auto" as const,
-              callback: async () => {
-                const deadline = Date.now() + Math.min(LOGIN_TIMEOUT_MS, Number(dev.expires_in || 600) * 1000);
-                let interval = Math.max(1, Number(dev.interval || 5));
-                while (Date.now() < deadline) {
-                  await sleep(interval * 1000);
-                  const r = await pollOnce(dev.device_code);
-                  if (r.kind === "success") {
-                    const a = toAuth(r.data);
-                    log("info", "signed in via device flow");
-                    toast("success", "Signed in to Kimi (subscription)", "Kimi Code");
-                    return { type: "success" as const, access: a.access, refresh: a.refresh, expires: a.expires };
-                  }
-                  if (r.kind === "denied" || r.kind === "expired" || r.kind === "error") {
-                    log("warn", "device flow did not complete", { reason: r.kind });
-                    return { type: "failed" as const };
-                  }
-                  if (r.err === "slow_down") interval += 5;
-                }
-                log("warn", "device flow timed out");
-                return { type: "failed" as const };
-              },
-            };
-          },
-        },
-      ],
+    ...base,
+    name: m.display_name || m.id,
+    limit: { context: Number(m.context_length) || 262_144, output: DEFAULT_OUTPUT_LIMIT },
+    capabilities: {
+      ...base.capabilities,
+      input: m.supports_image_in || m.supports_video_in ? ["text", "image"] : ["text"],
+      // kimi coding models only accept temperature === 1; hide the knob.
+      temperature: false,
     },
   };
+}
+
+const PROVIDER_INFO: Provider.Info = {
+  id: PROVIDER,
+  name: PROVIDER_NAME,
+  activation: "enabled",
+  package: PROVIDER_PACKAGE,
+  settings: { baseURL: API_BASE },
+  integrationID: INTEGRATION,
 };
 
-export { KimiCodePlugin };
-export default KimiCodePlugin;
+export default Plugin.define({
+  id: "opencode-kimi-subscription",
+  async setup(ctx) {
+    // Structured-enough logging into the server log stream (best-effort;
+    // logging must never throw into the request path).
+    const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) => {
+      console.log(`[kimi-subscription] ${level}: ${message}`, extra ? JSON.stringify(extra) : "");
+    };
+
+    // ---- models: freshest cache, else the static baseline -------------------
+    const cached = readModelCache();
+    let models = (cached?.models ?? STATIC_MODELS).map(toModelInfo);
+
+    const listed = await ctx.provider.list();
+    const existingIds: string[] = (Array.isArray(listed) ? listed : listed?.data ?? []).map((p) => p.id);
+    const userDefined = existingIds.includes(PROVIDER);
+
+    if (!userDefined) {
+      // Registered transform: replayed on every catalog rebuild, so
+      // `ctx.provider.reload()` after a model sync picks up the new list.
+      await ctx.provider.transform((editor) => {
+        if (!editor.get(PROVIDER)) editor.add({ info: PROVIDER_INFO, models });
+      });
+      log("debug", "registered kimi-code provider", { models: models.map((m) => m.id), source: cached ? "cache" : "static" });
+    } else {
+      log("debug", "skipping kimi-code registration (user-defined provider present)");
+    }
+
+    // Refresh the model list from /models (needs a signed-in credential),
+    // throttled by TTL and a single-flight guard.
+    let syncing = false;
+    async function syncModels() {
+      if (syncing) return;
+      const current = readModelCache();
+      if (current && Date.now() - current.ts < MODEL_TTL_MS) return;
+      syncing = true;
+      try {
+        const connection = await ctx.integration.connection.active(INTEGRATION);
+        if (!connection) return;
+        const credential = await ctx.integration.connection.resolve(connection);
+        if (!credential || credential.type !== "oauth") return;
+        const discovered = await fetchModels(credential.access);
+        if (discovered.length) {
+          models = discovered.map(toModelInfo);
+          writeModelCache(discovered);
+          log("debug", "refreshed model list from /models", { models: discovered.map((m) => m.id) });
+          if (!userDefined) await ctx.provider.reload();
+        }
+      } catch (err) {
+        log("debug", "model sync failed; keeping current list", { error: errorMessage(err) });
+      } finally {
+        syncing = false;
+      }
+    }
+    void syncModels();
+
+    // ---- integration: OAuth device flow + token refresh ---------------------
+    await ctx.integration.transform((editor) => {
+      if (!editor.get(INTEGRATION)) {
+        try {
+          editor.update(INTEGRATION, (integration) => {
+            integration.name = PROVIDER_NAME;
+          });
+        } catch {
+          // Integration may materialize from the provider's integrationID.
+        }
+      }
+      editor.method.update({
+        integrationID: INTEGRATION,
+        method: { id: METHOD, type: "oauth", label: "Sign in with Kimi (subscription)" },
+        authorize: async () => {
+          const dev = await requestDeviceCode();
+          log("info", "device authorization started");
+          const callback = (async () => {
+            const deadline = Date.now() + Math.min(LOGIN_TIMEOUT_MS, Number(dev.expires_in || 600) * 1000);
+            let interval = Math.max(1, Number(dev.interval || 5));
+            while (Date.now() < deadline) {
+              await sleep(interval * 1000);
+              const r = await pollOnce(dev.device_code);
+              if (r.kind === "success") {
+                const a = toCredential(r.data);
+                log("info", "signed in via device flow");
+                // Pick up the live model list right after sign-in.
+                void (async () => {
+                  try {
+                    const discovered = await fetchModels(a.access);
+                    if (discovered.length) {
+                      models = discovered.map(toModelInfo);
+                      writeModelCache(discovered);
+                      log("debug", "refreshed model list after sign-in", { models: discovered.map((m) => m.id) });
+                      if (!userDefined) await ctx.provider.reload();
+                    }
+                  } catch (err) {
+                    log("debug", "post-login model sync failed", { error: errorMessage(err) });
+                  }
+                })();
+                return a;
+              }
+              if (r.kind === "denied" || r.kind === "expired" || r.kind === "error") {
+                log("warn", "device flow did not complete", { reason: r.kind });
+                throw new Error(
+                  r.kind === "denied" ? "Kimi sign-in was denied" : r.kind === "expired" ? "Kimi device code expired" : `Kimi sign-in failed (HTTP ${r.status})`,
+                );
+              }
+              if (r.err === "slow_down") interval += 5;
+            }
+            log("warn", "device flow timed out");
+            throw new Error("Kimi sign-in timed out");
+          })();
+          return {
+            url: dev.verification_uri_complete || dev.verification_uri || "",
+            instructions: `Approve the sign-in in your browser.${dev.user_code ? ` Code: ${dev.user_code}` : ""}`,
+            expiresAt: dev.expires_in ? Date.now() + dev.expires_in * 1000 : undefined,
+            mode: "auto" as const,
+            callback,
+          };
+        },
+        refresh: async (credential) => {
+          try {
+            const next = toCredential(await refreshToken(credential.refresh));
+            log("debug", "access token refreshed", { validForMs: next.expires - Date.now() });
+            return next;
+          } catch (err) {
+            log("error", "token refresh failed", {
+              status: err instanceof RefreshError ? err.status : undefined,
+              error: errorMessage(err),
+            });
+            throw err;
+          }
+        },
+      });
+    });
+
+    // kimi coding models only accept temperature === 1 — pin it on every
+    // request (request-level guarantee, independent of UI).
+    await ctx.session.hook(
+      "context",
+      (event) => {
+        event.options.temperature = 1;
+      },
+      { providerID: PROVIDER },
+    );
+
+    // Expired-token race: give the core one more attempt after it has
+    // refreshed the credential (refresh callback above).
+    await ctx.session.hook(
+      "retry",
+      (event) => {
+        if (event.attempt <= 1 && (event.error.status === 401 || event.error.status === 403)) {
+          event.decision = { retry: true, delay: 0 };
+        }
+      },
+      { providerID: PROVIDER },
+    );
+
+    log("info", `loaded (OpenCode ${ctx.app.version})`, { provider: PROVIDER, apiBase: API_BASE });
+
+    const timer = setInterval(() => void syncModels(), MODEL_TTL_MS);
+    return () => clearInterval(timer);
+  },
+});

@@ -1,11 +1,12 @@
-// Structural + behavioral smoke test — no network, no credentials required.
-// Verifies the plugin self-registers its provider, reads discovered models
-// from the on-disk cache, and (with a stubbed global fetch) drives the real
-// request path: auth-header injection, temperature pinning, and the
-// refresh-and-retry-once behavior on an upstream 401.
+// Structural + behavioral smoke test for the V2 plugin — no network, no
+// credentials required. Drives the `Plugin.define` setup() against a stub
+// plugin context and verifies: provider self-registration (with the on-disk
+// model cache), respect for a user-defined provider, the OAuth device-flow
+// method (real authorize/refresh callbacks against a stubbed fetch), the
+// /models sync, and the temperature/retry request hooks.
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { writeFileSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,210 +15,281 @@ import { join } from "node:path";
 const CACHE = join(tmpdir(), `kimi-smoke-${process.pid}.json`);
 process.env.KIMI_SUBSCRIPTION_CACHE = CACHE;
 const mod = await import("../dist/index.js");
-const { KimiCodePlugin } = mod;
+const plugin = mod.default;
 
 after(() => rmSync(CACHE, { force: true }));
 
-// Fresh mock client per test; records everything the plugin sends it.
-function makeClient() {
-  const calls = { logs: [], toasts: [], authSet: [] };
-  const client = {
-    auth: { set: async ({ path, body }) => (calls.authSet.push({ path, body }), true) },
-    app: { log: async (o) => (calls.logs.push(o.body), true) },
-    tui: { showToast: async (o) => (calls.toasts.push(o.body), true) },
+const OAUTH_HOST = "https://auth.kimi.com";
+const DEV = {
+  device_code: "DEV",
+  verification_uri: "https://kimi.com/code",
+  verification_uri_complete: "https://kimi.com/code?user_code=CODE12",
+  user_code: "CODE12",
+  expires_in: 600,
+  interval: 1,
+};
+const TOKEN_OK = { access_token: "AAA", refresh_token: "RRR", expires_in: 900 };
+
+// ---- stub plugin context --------------------------------------------------
+function makeCtx({ providers = [], credential = null } = {}) {
+  const calls = {
+    providerTransforms: [],
+    providerAdd: null,
+    integrationTransforms: [],
+    methodUpdates: [],
+    hooks: [],
+    reloads: 0,
   };
-  return { client, calls };
+  const providerRecords = providers.map((p) => ({ provider: p, models: new Map() }));
+  const providerEditor = {
+    list: () => providerRecords,
+    get: (id) => providerRecords.find((r) => r.provider.id === id),
+    add: (input) => {
+      providerRecords.push({ provider: input.info, models: new Map() });
+      calls.providerAdd = input;
+    },
+    update: () => {},
+    remove: () => {},
+    models: { set: () => {}, update: () => {}, remove: () => {} },
+  };
+  const integrationRefs = [];
+  const integrationEditor = {
+    list: () => integrationRefs,
+    get: (id) => integrationRefs.find((r) => r.id === id),
+    update: (id, fn) => {
+      const ref = integrationRefs.find((r) => r.id === id) || (integrationRefs.push({ id, name: "" }), integrationRefs[integrationRefs.length - 1]);
+      fn(ref);
+    },
+    remove: () => {},
+    method: { list: () => [], update: (reg) => calls.methodUpdates.push(reg), remove: () => {} },
+  };
+  const ctx = {
+    app: { name: "opencode", version: "2.2.4-test", channel: "test" },
+    location: { directory: "/tmp", project: { id: "p", directory: "/tmp", canonical: "/tmp" } },
+    options: {},
+    provider: {
+      list: async () => providerRecords.map((r) => r.provider),
+      transform: async (cb) => {
+        calls.providerTransforms.push(cb);
+        cb(providerEditor);
+        return { dispose: async () => {} };
+      },
+      reload: async () => calls.reloads++,
+    },
+    integration: {
+      transform: async (cb) => {
+        calls.integrationTransforms.push(cb);
+        cb(integrationEditor);
+        return { dispose: async () => {} };
+      },
+      connection: {
+        active: async (id) => (credential ? { id: `c-${id}`, integrationID: id } : undefined),
+        resolve: async () => credential,
+      },
+    },
+    session: {
+      hook: async (name, cb, opts) => {
+        calls.hooks.push({ name, cb, opts });
+        return { dispose: async () => {} };
+      },
+    },
+  };
+  return { ctx, calls };
 }
 
-// log/toast are fire-and-forget (microtask-deferred); let them settle.
-const settle = () => new Promise((r) => setImmediate(r));
+const jsonResponse = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-// Seed a fresh model cache so the loader's fire-and-forget /models sync
-// short-circuits instead of hitting the stubbed fetch mid-test.
-const seedFreshCache = () => writeFileSync(CACHE, JSON.stringify({ ts: Date.now(), models: [{ id: "k3" }] }));
-
-// Stub globalThis.fetch, routing BY URL — never by call order (the model-sync
-// fetch would make call counts nondeterministic). Restored automatically.
 function stubFetch(t, routes) {
-  const calls = [];
   t.mock.method(globalThis, "fetch", async (input, init) => {
     const url = String(input);
-    calls.push({ url, init });
     for (const [substring, handler] of routes) {
-      if (url.includes(substring)) return handler(init, calls);
+      if (url.includes(substring)) return handler(init);
     }
     throw new Error(`unexpected fetch in test: ${url}`);
   });
-  return calls;
 }
 
-const jsonResponse = (status, body) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const FRESH_CREDENTIAL = () => ({ type: "oauth", methodID: "device", access: "AAA", refresh: "RRR", expires: Date.now() + 3_600_000 });
+const seedCache = (models, ts = Date.now()) => writeFileSync(CACHE, JSON.stringify({ ts, models }));
 
-const FRESH_AUTH = () => ({ type: "oauth", access: "AAA", refresh: "RRR", expires: Date.now() + 3_600_000 });
-const STALE_AUTH = () => ({ type: "oauth", access: "OLD", refresh: "RRR", expires: Date.now() + 60_000 });
-const REFRESH_OK = { access_token: "NEW", refresh_token: "NEWR", expires_in: 900 };
-const API_URL = "https://api.kimi.com/coding/v1/chat/completions";
+async function runSetup(t, opts = {}) {
+  const { ctx, calls } = makeCtx(opts);
+  const cleanup = await plugin.setup(ctx);
+  t.after(() => (typeof cleanup === "function" ? cleanup() : undefined));
+  return { ctx, calls };
+}
 
-test("entry module exports exactly the plugin (OpenCode invokes every export as a plugin)", () => {
-  assert.deepEqual(Object.keys(mod).sort(), ["KimiCodePlugin", "default"]);
-  assert.equal(typeof mod.KimiCodePlugin, "function");
-  assert.equal(mod.default, mod.KimiCodePlugin);
+const methodReg = (calls) => {
+  const reg = calls.methodUpdates.find((m) => m.method.type === "oauth");
+  assert.ok(reg, "oauth method registered");
+  return reg;
+};
+
+// ---- tests ----------------------------------------------------------------
+
+test("entry module exports a V2 plugin definition (id + setup)", () => {
+  assert.equal(typeof plugin, "object");
+  assert.equal(plugin.id, "opencode-kimi-subscription");
+  assert.equal(typeof plugin.setup, "function");
 });
 
-test("config hook registers the provider + static models and logs it", async () => {
+test("setup registers the kimi-code provider with the on-disk cache models", async (t) => {
+  seedCache([
+    { id: "k3", display_name: "Kimi K3", context_length: 1_048_576 },
+    { id: "k9-future", display_name: "Kimi K9 (future)", context_length: 2_000_000, supports_reasoning: true },
+  ]);
+  const { calls } = await runSetup(t);
+
+  assert.equal(calls.providerTransforms.length, 1, "provider transform registered");
+  const added = calls.providerAdd;
+  assert.ok(added, "provider added via transform");
+  assert.equal(added.info.id, "kimi-code");
+  assert.equal(added.info.name, "Kimi Code (subscription)");
+  assert.equal(added.info.package, "@opencode/ai/providers/openai-compatible");
+  assert.equal(added.info.activation, "enabled");
+  assert.ok(added.info.settings.baseURL.includes("api.kimi.com"), "baseURL points at kimi");
+  const ids = added.models.map((m) => m.id);
+  assert.ok(ids.includes("k9-future"), "cached model registered");
+  const k9 = added.models.find((m) => m.id === "k9-future");
+  assert.equal(k9.name, "Kimi K9 (future)");
+  assert.equal(k9.limit.context, 2_000_000, "cached context window applied");
+  assert.equal(k9.providerID, "kimi-code");
+});
+
+test("setup falls back to the static baseline without a cache", async (t) => {
   rmSync(CACHE, { force: true });
-  const { client, calls } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-
-  const cfg = {};
-  await hooks.config(cfg);
-  const provider = cfg.provider?.["kimi-code"];
-  assert.ok(provider, "config hook must add the kimi-code provider");
-  assert.equal(provider.npm, "@ai-sdk/openai-compatible");
-  assert.ok(provider.options.baseURL.includes("api.kimi.com"), "baseURL points at kimi");
-  assert.ok(Object.keys(provider.models).includes("k3"), "k3 model registered");
-  assert.equal(provider.models.k3.temperature, false, "temperature disabled (kimi requires temp=1)");
-
-  await settle();
-  assert.ok(
-    calls.logs.some((l) => l.service === "kimi-subscription" && /registered/.test(l.message)),
-    "registration is logged via client.app.log",
-  );
-  assert.ok(
-    calls.logs.every((l) => ["debug", "info", "warn", "error"].includes(l.level)),
-    "log levels are valid",
-  );
+  const { calls } = await runSetup(t);
+  const ids = calls.providerAdd.models.map((m) => m.id);
+  assert.deepEqual(ids.sort(), ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"]);
 });
 
-test("config hook respects an existing user-defined kimi-code provider", async () => {
-  const { client } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const custom = { provider: { "kimi-code": { npm: "x", options: { baseURL: "https://custom" }, models: {} } } };
-  await hooks.config(custom);
-  assert.equal(custom.provider["kimi-code"].options.baseURL, "https://custom", "must not overwrite user config");
+test("setup respects a user-defined kimi-code provider", async (t) => {
+  rmSync(CACHE, { force: true });
+  const { calls } = await runSetup(t, { providers: [{ id: "kimi-code", name: "Custom", activation: "enabled", package: "x" }] });
+  assert.equal(calls.providerTransforms.length, 0, "no provider transform for a user-defined provider");
+  assert.ok(methodReg(calls), "oauth method is still registered");
 });
 
-test("config hook picks up models from the discovery cache", async () => {
-  writeFileSync(
-    CACHE,
-    JSON.stringify({
-      ts: Date.now(),
-      models: [
-        { id: "k3", display_name: "Kimi K3", context_length: 1_048_576 },
-        { id: "k9-future", display_name: "Kimi K9 (future)", context_length: 2_000_000, supports_reasoning: true },
-      ],
-    }),
-  );
-  const { client } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const cfg = {};
-  await hooks.config(cfg);
-  const models = cfg.provider["kimi-code"].models;
-  assert.ok(Object.keys(models).includes("k9-future"), "config hook picks up newly-cached models");
-  assert.equal(models["k9-future"].limit.context, 2_000_000, "cached context window applied");
+test("setup registers the OAuth device-flow method on the kimi-code integration", async (t) => {
+  rmSync(CACHE, { force: true });
+  const { calls } = await runSetup(t);
+  const reg = methodReg(calls);
+  assert.equal(reg.integrationID, "kimi-code");
+  assert.equal(reg.method.id, "device");
+  assert.equal(reg.method.label, "Sign in with Kimi (subscription)");
+  assert.equal(typeof reg.authorize, "function");
+  assert.equal(typeof reg.refresh, "function");
 });
 
-test("auth hook registers the oauth method and loader shape", async () => {
-  const { client } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  assert.equal(hooks.auth.provider, "kimi-code");
-  const method = hooks.auth.methods.find((m) => m.type === "oauth");
-  assert.equal(method?.label, "Sign in with Kimi (subscription)");
-  const opts = await hooks.auth.loader(async () => FRESH_AUTH());
-  assert.equal(typeof opts.fetch, "function", "loader returns a fetch");
-  assert.equal(opts.apiKey, "");
-});
+test("authorize drives the device flow and resolves a credential (stubbed endpoints)", async (t) => {
+  seedCache([{ id: "k3" }]);
+  const { calls } = await runSetup(t);
+  const reg = methodReg(calls);
 
-test("loader fetch injects the bearer token and strips x-api-key", async (t) => {
-  seedFreshCache();
-  const { client } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const { fetch: pluginFetch } = await hooks.auth.loader(async () => FRESH_AUTH());
-
-  let seen;
-  stubFetch(t, [[API_URL, (init) => ((seen = init), jsonResponse(200, { ok: true }))]]);
-  const res = await pluginFetch(API_URL, { method: "POST", headers: { "x-api-key": "leak" } });
-
-  assert.equal(res.status, 200);
-  assert.equal(seen.headers.get("authorization"), "Bearer AAA");
-  assert.equal(seen.headers.get("x-api-key"), null, "x-api-key must be stripped");
-});
-
-test("loader fetch pins temperature to 1 through the real request path", async (t) => {
-  seedFreshCache();
-  const { client } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const { fetch: pluginFetch } = await hooks.auth.loader(async () => FRESH_AUTH());
-
-  let seen;
-  stubFetch(t, [[API_URL, (init) => ((seen = init), jsonResponse(200, { ok: true }))]]);
-  await pluginFetch(API_URL, { method: "POST", body: JSON.stringify({ model: "k3", temperature: 0 }) });
-
-  assert.deepEqual(JSON.parse(seen.body), { model: "k3", temperature: 1 });
-});
-
-test("upstream 401 forces one refresh and one retry, persisting the new token", async (t) => {
-  seedFreshCache();
-  const { client, calls } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const { fetch: pluginFetch } = await hooks.auth.loader(async () => FRESH_AUTH());
-
-  const apiInits = [];
-  const refreshInits = [];
+  let polls = 0;
   stubFetch(t, [
-    ["/api/oauth/token", (init) => (refreshInits.push(init), jsonResponse(200, REFRESH_OK))],
-    [API_URL, (init) => (apiInits.push(init), jsonResponse(apiInits.length === 1 ? 401 : 200, { ok: true }))],
+    [`${OAUTH_HOST}/api/oauth/device_authorization`, () => jsonResponse(200, DEV)],
+    [
+      `${OAUTH_HOST}/api/oauth/token`,
+      (init) => {
+        assert.equal(init.body.get("grant_type"), "urn:ietf:params:oauth:grant-type:device_code");
+        return jsonResponse(200, ++polls < 2 ? { error: "authorization_pending" } : TOKEN_OK);
+      },
+    ],
+    ["api.kimi.com/coding/v1/models", () => jsonResponse(200, { data: [{ id: "k3" }] })],
   ]);
-  const res = await pluginFetch(API_URL, { method: "POST" });
 
-  assert.equal(res.status, 200);
-  assert.equal(apiInits.length, 2, "exactly one retry");
-  assert.equal(refreshInits.length, 1, "exactly one refresh call");
-  assert.equal(refreshInits[0].body.get("grant_type"), "refresh_token");
-  assert.equal(apiInits[1].headers.get("authorization"), "Bearer NEW", "retry uses the refreshed token");
-  assert.equal(calls.authSet[0]?.body.access, "NEW", "new token persisted via client.auth.set");
+  const authz = await reg.authorize({});
+  assert.equal(authz.url, "https://kimi.com/code?user_code=CODE12");
+  assert.match(authz.instructions, /CODE12/);
+  assert.equal(authz.mode, "auto");
+  assert.ok(authz.callback instanceof Promise);
+
+  const credential = await authz.callback;
+  assert.deepEqual(
+    { type: credential.type, methodID: credential.methodID, access: credential.access, refresh: credential.refresh },
+    { type: "oauth", methodID: "device", access: "AAA", refresh: "RRR" },
+  );
+  assert.ok(credential.expires > Date.now() + 800_000, "expires ~15 min in the future");
 });
 
-test("a near-expiry stored token is refreshed before the first upstream attempt", async (t) => {
-  seedFreshCache();
-  const { client, calls } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const { fetch: pluginFetch } = await hooks.auth.loader(async () => STALE_AUTH());
+test("refresh callback exchanges the refresh token for a new credential", async (t) => {
+  seedCache([{ id: "k3" }]);
+  const { calls } = await runSetup(t);
+  const reg = methodReg(calls);
 
-  const apiInits = [];
-  let refreshes = 0;
+  let grant;
   stubFetch(t, [
-    ["/api/oauth/token", () => (refreshes++, jsonResponse(200, REFRESH_OK))],
-    [API_URL, (init) => (apiInits.push(init), jsonResponse(200, { ok: true }))],
+    [
+      `${OAUTH_HOST}/api/oauth/token`,
+      (init) => {
+        grant = init.body.get("grant_type");
+        return jsonResponse(200, { access_token: "NEW", refresh_token: "NEWR", expires_in: 900 });
+      },
+    ],
   ]);
-  await pluginFetch(API_URL, { method: "POST" });
 
-  assert.equal(refreshes, 1, "refresh happens up front");
-  assert.equal(apiInits.length, 1, "no retry needed");
-  assert.equal(apiInits[0].headers.get("authorization"), "Bearer NEW");
-  assert.equal(calls.authSet[0]?.body.access, "NEW");
+  const next = await reg.refresh({ type: "oauth", methodID: "device", access: "OLD", refresh: "RRR", expires: Date.now() });
+  assert.equal(grant, "refresh_token");
+  assert.equal(next.access, "NEW");
+  assert.equal(next.refresh, "NEWR");
+  assert.equal(next.type, "oauth");
 });
 
-test("a failed refresh propagates, never hits the API, and raises a toast", async (t) => {
-  seedFreshCache();
-  const { client, calls } = makeClient();
-  const hooks = await KimiCodePlugin({ client });
-  const { fetch: pluginFetch } = await hooks.auth.loader(async () => STALE_AUTH());
-
-  const fetchCalls = stubFetch(t, [
-    ["/api/oauth/token", () => jsonResponse(401, { error: "invalid_grant" })],
-    [API_URL, () => jsonResponse(200, { ok: true })],
-  ]);
-  await assert.rejects(pluginFetch(API_URL, { method: "POST" }), /token refresh failed \(HTTP 401\)/);
-
-  assert.ok(
-    fetchCalls.every((c) => !c.url.includes(API_URL)),
-    "API is never called with a dead token",
-  );
-  await settle();
-  assert.ok(
-    calls.toasts.some((tst) => tst.variant === "error" && /session expired/.test(tst.message)),
-    "session-expired toast raised",
-  );
+test("context hook pins temperature to 1 for kimi-code", async (t) => {
+  rmSync(CACHE, { force: true });
+  const { calls } = await runSetup(t);
+  const hook = calls.hooks.find((h) => h.name === "context");
+  assert.ok(hook, "context hook registered");
+  assert.equal(hook.opts?.providerID, "kimi-code", "scoped to kimi-code");
+  const event = { options: { temperature: 0.2 } };
+  hook.cb(event);
+  assert.equal(event.options.temperature, 1);
 });
+
+test("retry hook allows one retry on 401/403 for kimi-code", async (t) => {
+  rmSync(CACHE, { force: true });
+  const { calls } = await runSetup(t);
+  const hook = calls.hooks.find((h) => h.name === "retry");
+  assert.ok(hook, "retry hook registered");
+  assert.equal(hook.opts?.providerID, "kimi-code", "scoped to kimi-code");
+
+  const first = { attempt: 1, error: { status: 401, message: "expired" }, decision: { retry: false } };
+  hook.cb(first);
+  assert.deepEqual(first.decision, { retry: true, delay: 0 }, "401 -> retry once");
+
+  const second = { attempt: 2, error: { status: 401, message: "expired" }, decision: { retry: false } };
+  hook.cb(second);
+  assert.deepEqual(second.decision, { retry: false }, "no second retry");
+
+  const other = { attempt: 1, error: { status: 500, message: "boom" }, decision: { retry: false } };
+  hook.cb(other);
+  assert.deepEqual(other.decision, { retry: false }, "other statuses untouched");
+});
+
+test("stale model cache is refreshed from /models and the provider reloaded", async (t) => {
+  seedCache([{ id: "stale-model" }], Date.now() - 7 * 60 * 60 * 1000);
+  // Install the stub BEFORE setup: the initial syncModels() fires during setup.
+  stubFetch(t, [
+    ["api.kimi.com/coding/v1/models", () => jsonResponse(200, { data: [{ id: "live-model", display_name: "Live Model", context_length: 1000 }] })],
+  ]);
+  const { calls } = await runSetup(t, { credential: FRESH_CREDENTIAL() });
+
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (exists(CACHE) && readFileSync(CACHE, "utf8").includes("live-model")) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const cached = JSON.parse(readFileSync(CACHE, "utf8"));
+  assert.ok(cached.models.some((m) => m.id === "live-model"), "cache refreshed from /models");
+  assert.ok(calls.reloads >= 1, "provider catalog reloaded");
+});
+
+function exists(p) {
+  try {
+    readFileSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}

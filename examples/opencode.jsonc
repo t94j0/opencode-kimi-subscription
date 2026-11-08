@@ -1,10 +1,10 @@
 {
   // Minimal setup: just add the plugin. It self-registers the "kimi-code"
   // provider and its models, and adds "Sign in with Kimi (subscription)" to
-  // `opencode auth login`.
+  // the model picker / /connect.
   "$schema": "https://opencode.ai/config.json",
   "plugin": ["opencode-kimi-subscription"],
 
-  // During local development, `npm run build` and point at the built output:
-  // "plugin": ["/absolute/path/to/opencode-kimi-subscription/dist/index.js"]
+  // Local fork (this repo, OpenCode 2.x build) — point at the repo root:
+  // "plugin": ["d:/AI_PetProjects/opencode-kimi-subscription"]
 }

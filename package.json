@@ -1,6 +1,6 @@
 {
   "name": "opencode-kimi-subscription",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Use your Kimi Code (Moonshot) subscription in OpenCode via OAuth — sign in with the device flow, no API tokens.",
   "type": "module",
   "main": "dist/index.js",
@@ -42,16 +42,11 @@
   "bugs": {
     "url": "https://github.com/t94j0/opencode-kimi-subscription/issues"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": "*"
-  },
-  "peerDependenciesMeta": {
-    "@opencode-ai/plugin": {
-      "optional": true
-    }
+  "dependencies": {
+    "@opencode/plugin": "2.3.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.3",
+    "@opencode/client": "2.3.0",
     "@types/node": "^22",
     "oxlint": "^1.0.0",
     "prettier": "^3.3.0",

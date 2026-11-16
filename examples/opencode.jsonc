@@ -1,10 +1,12 @@
 {
-  // Minimal setup: just add the plugin. It self-registers the "kimi-code"
-  // provider and its models, and adds "Sign in with Kimi (subscription)" to
-  // `opencode auth login`.
+  // Build from source: npm install && npm run build.
+  // Add this entry to your existing plugins array.
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-kimi-subscription"],
-
-  // During local development, `npm run build` and point at the built output:
-  // "plugin": ["/absolute/path/to/opencode-kimi-subscription/dist/index.js"]
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-kimi-subscription",
+      // Use "global" for kimi.ai or "mainland-cn" for kimi.com.
+      "options": { "region": "global" },
+    },
+  ],
 }

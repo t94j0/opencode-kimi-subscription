@@ -79,7 +79,7 @@ async function setup(t, options) {
   return { ...result, cleanup };
 }
 
-test("entrypoint registers a V2 definition, provider, integration, and four request hooks", async (t) => {
+test("entrypoint registers a V2 definition, provider, integration, request hooks, and retry", async (t) => {
   rmSync(CACHE, { force: true });
   assert.deepEqual(Object.keys(plugin).sort(), ["id", "setup"]);
   const { calls, getProvider, integrations } = await setup(t);
@@ -97,13 +97,25 @@ test("entrypoint registers a V2 definition, provider, integration, and four requ
   assert.equal(calls.methods.get("device").method.type, "oauth");
   assert.deepEqual(
     calls.hooks.map((hook) => hook.name),
-    ["context", "compaction", "generate", "title"],
+    ["context", "compaction", "generate", "title", "retry"],
   );
-  for (const hook of calls.hooks) {
+  for (const hook of calls.hooks.filter((hook) => hook.name !== "retry")) {
     assert.equal(hook.options.providerID, "kimi-code");
     const event = { options: { temperature: 0 } };
     hook.callback(event);
     assert.equal(event.options.temperature, 1);
+  }
+  const retry = calls.hooks.find((hook) => hook.name === "retry");
+  assert.equal(retry.options.providerID, "kimi-code");
+  for (const [attempt, status, expected] of [
+    [1, 401, { retry: true, delay: 0 }],
+    [1, 403, { retry: true, delay: 0 }],
+    [2, 401, undefined],
+    [1, 404, undefined],
+  ]) {
+    const event = { attempt, error: { status }, decision: undefined };
+    retry.callback(event);
+    assert.deepEqual(event.decision, expected, `attempt=${attempt} status=${status}`);
   }
 });
 

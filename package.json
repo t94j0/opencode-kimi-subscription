@@ -61,6 +61,7 @@
     "pretest": "npm run build",
     "test": "node --test test/unit.test.mjs test/smoke.test.mjs",
     "test:integration": "node test/integration.mjs",
+    "test:integration-live": "node test/integration-live.mjs",
     "ci": "npm run lint && npm run format:check && npm run typecheck && npm test",
     "prepublishOnly": "npm run build"
   }

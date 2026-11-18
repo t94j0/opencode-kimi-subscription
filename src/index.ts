@@ -1,3 +1,18 @@
+// opencode-kimi-subscription — consolidated V2 fork (v0.3.0)
+// Based on Slavenin PR #4 (V2 + regions) + Alvain1980 retry hook.
+//
+// What it does:
+//  - self-registers the kimi-code provider with live /models discovery
+//  - adds "Sign in with Kimi (subscription)" OAuth device-flow method
+//  - pins temperature to 1 on context/compaction/generate/title hooks
+//  - retries once on 401/403 (expired-token race, from Alvain1980 fork)
+//  - supports mainland-cn (kimi.com) and global (kimi.ai) regions
+//
+// Load from opencode.json(c):
+//   { "plugins": [{ "package": "/absolute/path/to/opencode-kimi-subscription", "options": { "region": "global" } }] }
+// Or legacy: { "plugin": ["/absolute/path/to/opencode-kimi-subscription"] }
+// Both keys work in OpenCode 2.3.0.
+
 import { Plugin, Provider } from "@opencode/plugin";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -243,6 +258,18 @@ export default Plugin.define({
         { providerID },
       );
     }
+
+    // Expired-token race: give the core one more attempt after it has
+    // refreshed the credential (refresh callback above).
+    await ctx.session.hook(
+      "retry",
+      (event) => {
+        if (event.attempt <= 1 && (event.error.status === 401 || event.error.status === 403)) {
+          event.decision = { retry: true, delay: 0 };
+        }
+      },
+      { providerID },
+    );
 
     void syncModels();
     const timer = setInterval(() => void syncModels(), MODEL_TTL_MS);

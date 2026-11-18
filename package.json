@@ -1,6 +1,6 @@
 {
   "name": "opencode-kimi-subscription",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Use your Kimi Code (Moonshot) subscription in OpenCode via OAuth — sign in with the device flow, no API tokens.",
   "type": "module",
   "main": "dist/index.js",
